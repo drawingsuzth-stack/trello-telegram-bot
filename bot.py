@@ -1,11 +1,13 @@
 import os
-import time
-import threading
 import requests
+import time
 from flask import Flask
+import threading
+from datetime import datetime
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+
 TRELLO_KEY = os.getenv("TRELLO_KEY")
 TRELLO_TOKEN = os.getenv("TRELLO_TOKEN")
 BOARD_ID = os.getenv("BOARD_ID")
@@ -14,75 +16,106 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Diagnostika bot ishlayapti ✅"
+    return "Bot ishlayapti!"
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=20)
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text
+    }
+    requests.post(url, data=data)
 
-def get_trello_cards_debug():
+def get_cards():
     url = f"https://api.trello.com/1/boards/{BOARD_ID}/cards"
     params = {
         "key": TRELLO_KEY,
         "token": TRELLO_TOKEN
     }
+    return requests.get(url, params=params).json()
 
-    try:
-        response = requests.get(url, params=params, timeout=30)
+def get_lists():
+    url = f"https://api.trello.com/1/boards/{BOARD_ID}/lists"
+    params = {
+        "key": TRELLO_KEY,
+        "token": TRELLO_TOKEN
+    }
+    return requests.get(url, params=params).json()
 
-        text = "🧪 DIAGNOSTIKA HISOBOTI\n\n"
-        text += f"BOT_TOKEN: {'BOR ✅' if BOT_TOKEN else 'YO‘Q ❌'}\n"
-        text += f"CHAT_ID: {'BOR ✅' if CHAT_ID else 'YO‘Q ❌'}\n"
-        text += f"TRELLO_KEY: {'BOR ✅' if TRELLO_KEY else 'YO‘Q ❌'}\n"
-        text += f"TRELLO_TOKEN: {'BOR ✅' if TRELLO_TOKEN else 'YO‘Q ❌'}\n"
-        text += f"BOARD_ID: {BOARD_ID if BOARD_ID else 'YO‘Q ❌'}\n\n"
+def get_report():
+    cards = get_cards()
+    lists = get_lists()
 
-        text += f"Trello status code: {response.status_code}\n"
+    list_map = {l["id"]: l["name"] for l in lists}
 
-        if response.status_code != 200:
-            text += f"Trello javobi:\n{response.text[:500]}"
-            return text
+    jami = len(cards)
+    yopilgan = 0
+    jarayonda = 0
+    kechikkan = 0
 
-        cards = response.json()
-        text += f"Trellodan kelgan kartalar soni: {len(cards)} ta\n"
+    # 👇 XODIM BO‘YICHA HISOB
+    employees = {}
 
-        if len(cards) > 0:
-            text += f"Birinchi karta nomi:\n{cards[0].get('name', 'Nomi yo‘q')}\n"
+    today = datetime.utcnow()
 
-        return text
+    for c in cards:
+        list_name = list_map.get(c["idList"], "").lower()
 
-    except Exception as e:
-        return f"❌ Diagnostika xato:\n{e}"
+        # 🔴 YOPILGAN
+        if "yopilgan" in list_name:
+            yopilgan += 1
+        else:
+            jarayonda += 1
+
+        # 🔴 KECHIKKAN
+        if c.get("due"):
+            due_date = datetime.strptime(c["due"][:10], "%Y-%m-%d")
+            if due_date < today and "yopilgan" not in list_name:
+                kechikkan += 1
+
+        # 🔴 XODIM HISOBI
+        if "yopilgan" not in list_name:
+            employees[list_name] = employees.get(list_name, 0) + 1
+
+    # 🔥 TEXT
+    text = f"""📊 Xarid bo‘limi hisobot
+
+📦 UMUMIY ZAYAVKALAR
+Jami: {jami} ta
+Jarayonda: {jarayonda} ta
+Yopilgan: {yopilgan} ta
+Kechikkan: {kechikkan} ta
+
+👨‍💼 XODIMLAR:
+"""
+
+    for emp, count in employees.items():
+        text += f"\n- {emp.title()}: {count} ta"
+
+    return text
 
 def bot_loop():
     last_update_id = None
 
     while True:
-        try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-            params = {}
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        if last_update_id:
+            url += f"?offset={last_update_id + 1}"
 
-            if last_update_id is not None:
-                params["offset"] = last_update_id + 1
+        res = requests.get(url).json()
 
-            result = requests.get(url, params=params, timeout=20).json()
+        for update in res.get("result", []):
+            last_update_id = update["update_id"]
 
-            for update in result.get("result", []):
-                last_update_id = update["update_id"]
+            if "message" in update:
+                text = update["message"].get("text", "")
 
-                message = update.get("message", {})
-                text = message.get("text", "").strip().lower()
-
-                if text in ["/hisobot", "hisobot"]:
-                    send_message(get_trello_cards_debug())
-
-        except Exception as e:
-            print("Bot loop xato:", e)
+                if text == "/hisobot":
+                    send_message(get_report())
 
         time.sleep(2)
 
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
-
+    threading.Thread(target=bot_loop).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
