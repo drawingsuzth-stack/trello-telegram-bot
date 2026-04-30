@@ -29,7 +29,25 @@ def home():
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
+
+    if len(text) <= 3900:
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
+        return
+
+    parts = []
+    while len(text) > 3900:
+        split_at = text.rfind("\n", 0, 3900)
+        if split_at == -1:
+            split_at = 3900
+        parts.append(text[:split_at])
+        text = text[split_at:].strip()
+
+    if text:
+        parts.append(text)
+
+    for part in parts:
+        requests.post(url, data={"chat_id": CHAT_ID, "text": part}, timeout=30)
+        time.sleep(1)
 
 
 def trello_get(path, extra=None):
@@ -83,7 +101,7 @@ def build_zayavka_type_map():
     for field in get_custom_fields():
         field_name = field.get("name", "").strip().lower()
 
-        if "zayavka turi" in field_name:
+        if "zayavka turi" in field_name or "заявка turi" in field_name:
             for option in field.get("options", []):
                 option_id = option.get("id")
                 option_text = option.get("value", {}).get("text", "")
@@ -148,6 +166,13 @@ def due_date(card):
         return None
 
 
+def due_text(card):
+    d = due_date(card)
+    if not d:
+        return "Muddat qo‘yilmagan"
+    return d.strftime("%d.%m.%Y")
+
+
 def is_overdue(card, list_name):
     d = due_date(card)
     if not d:
@@ -168,8 +193,31 @@ def is_due_within_5_days(card, list_name):
     return 0 <= days_left <= 5
 
 
+def card_description(card, limit=900):
+    desc = card.get("desc", "").strip()
+    if not desc:
+        return "Opisaniya yozilmagan"
+
+    if len(desc) > limit:
+        return desc[:limit] + "..."
+
+    return desc
+
+
 def card_short_url(card):
     return card.get("shortUrl") or card.get("url") or ""
+
+
+def member_names(card, member_map):
+    names = []
+
+    for member_id in card.get("idMembers", []):
+        names.append(member_map.get(member_id, member_id))
+
+    if not names:
+        return "Uchastnik biriktirilmagan"
+
+    return ", ".join(names)
 
 
 def initialize_known_cards():
@@ -189,6 +237,9 @@ def check_trello_changes():
 
     cards = get_cards()
     list_map = build_list_map()
+    member_map = build_member_map()
+    type_map = build_zayavka_type_map()
+
     new_known = {}
 
     for card in cards:
@@ -199,23 +250,32 @@ def check_trello_changes():
         card_name = card.get("name", "Nomsiz karta")
         list_name = list_map.get(card.get("idList"), "Noma’lum ustun")
         old_list = known_cards.get(card_id)
+        zayavka_type = get_card_type(card, type_map)
 
         new_known[card_id] = list_name
 
         if card_id not in known_cards:
             send_message(
                 f"🆕 Yangi zayavka qo‘shildi\n\n"
-                f"📌 {card_name}\n"
+                f"📌 Zayavka: {card_name}\n"
                 f"📂 Ustun: {list_name}\n"
+                f"📌 Turi: {zayavka_type}\n"
+                f"👥 Uchastniklar: {member_names(card, member_map)}\n"
+                f"📅 Deadline: {due_text(card)}\n\n"
+                f"📝 Opisaniya:\n{card_description(card)}\n\n"
                 f"🔗 {card_short_url(card)}"
             )
 
         elif old_list and not is_done(old_list) and is_done(list_name):
             send_message(
                 f"✅ Zayavka yopildi\n\n"
-                f"📌 {card_name}\n"
+                f"📌 Zayavka: {card_name}\n"
                 f"📂 Oldingi ustun: {old_list}\n"
                 f"📂 Hozirgi ustun: {list_name}\n"
+                f"📌 Turi: {zayavka_type}\n"
+                f"👥 Uchastniklar: {member_names(card, member_map)}\n"
+                f"📅 Deadline: {due_text(card)}\n\n"
+                f"📝 Opisaniya:\n{card_description(card)}\n\n"
                 f"🔗 {card_short_url(card)}"
             )
 
@@ -228,10 +288,13 @@ def check_trello_changes():
 
                 send_message(
                     f"⚠️ Muddat yaqinlashmoqda\n\n"
-                    f"📌 {card_name}\n"
+                    f"📌 Zayavka: {card_name}\n"
                     f"📂 Ustun: {list_name}\n"
+                    f"📌 Turi: {zayavka_type}\n"
+                    f"👥 Uchastniklar: {member_names(card, member_map)}\n"
                     f"📅 Deadline: {d.strftime('%d.%m.%Y')}\n"
-                    f"⏳ Qolgan vaqt: {days_left} kun\n"
+                    f"⏳ Qolgan vaqt: {days_left} kun\n\n"
+                    f"📝 Opisaniya:\n{card_description(card)}\n\n"
                     f"🔗 {card_short_url(card)}"
                 )
 
@@ -254,7 +317,13 @@ def generate_report():
     overdue = 0
     no_due = 0
 
-    type_stats = {}
+    type_stats = {
+        "Mahalliy": 0,
+        "Import": 0,
+        "Aralash": 0,
+        "Aniqlanmagan": 0
+    }
+
     column_stats = {}
     employee_stats = {}
 
@@ -276,16 +345,14 @@ def generate_report():
             no_due += 1
 
         card_type = get_card_type(card, type_map)
-        type_stats[card_type] = type_stats.get(card_type, 0) + 1
+        if card_type not in type_stats:
+            type_stats[card_type] = 0
+        type_stats[card_type] += 1
 
         if not done_status:
-            if list_name not in column_stats:
-                column_stats[list_name] = 0
-            column_stats[list_name] += 1
+            column_stats[list_name] = column_stats.get(list_name, 0) + 1
 
-        member_ids = card.get("idMembers", [])
-
-        for member_id in member_ids:
+        for member_id in card.get("idMembers", []):
             member_name = member_map.get(member_id, member_id)
 
             if member_name not in employee_stats:
@@ -294,7 +361,11 @@ def generate_report():
                     "active": 0,
                     "done": 0,
                     "overdue": 0,
-                    "no_due": 0
+                    "no_due": 0,
+                    "mahalliy": 0,
+                    "import": 0,
+                    "aralash": 0,
+                    "aniqlanmagan": 0
                 }
 
             employee_stats[member_name]["total"] += 1
@@ -310,6 +381,16 @@ def generate_report():
             if no_due_status:
                 employee_stats[member_name]["no_due"] += 1
 
+            t = card_type.lower()
+            if "mahalliy" in t:
+                employee_stats[member_name]["mahalliy"] += 1
+            elif "import" in t:
+                employee_stats[member_name]["import"] += 1
+            elif "aralash" in t:
+                employee_stats[member_name]["aralash"] += 1
+            else:
+                employee_stats[member_name]["aniqlanmagan"] += 1
+
     text = f"📊 Xarid bo‘limi hisobot — {CURRENT_YEAR} yil\n\n"
 
     text += "━━━━━━━━━━━━━━━━━━\n"
@@ -324,12 +405,15 @@ def generate_report():
     text += "━━━━━━━━━━━━━━━━━━\n"
     text += "📌 ZAYAVKA TURI BO‘YICHA\n"
     text += "━━━━━━━━━━━━━━━━━━\n"
-    for name, count in sorted(type_stats.items()):
-        text += f"{name}: {count} ta\n"
+    text += f"Mahalliy: {type_stats.get('Mahalliy', 0)} ta\n"
+    text += f"Import: {type_stats.get('Import', 0)} ta\n"
+    text += f"Aralash: {type_stats.get('Aralash', 0)} ta\n"
+    text += f"Aniqlanmagan: {type_stats.get('Aniqlanmagan', 0)} ta\n\n"
 
-    text += "\n━━━━━━━━━━━━━━━━━━\n"
+    text += "━━━━━━━━━━━━━━━━━━\n"
     text += "📂 USTUNLAR BO‘YICHA JARAYONDA\n"
     text += "━━━━━━━━━━━━━━━━━━\n"
+
     for name, count in sorted(column_stats.items()):
         if not is_done(name):
             text += f"{name}: {count} ta\n"
@@ -341,11 +425,15 @@ def generate_report():
     if employee_stats:
         for employee, data in sorted(employee_stats.items()):
             text += f"\n🔹 {employee}\n"
-            text += f"   Ishtirok etayotgan jami: {data['total']} ta\n"
+            text += f"   Ishtirok jami: {data['total']} ta\n"
             text += f"   Jarayonda: {data['active']} ta\n"
             text += f"   Yopilgan: {data['done']} ta\n"
             text += f"   Kechikkan: {data['overdue']} ta\n"
             text += f"   Muddatsiz: {data['no_due']} ta\n"
+            text += f"   Mahalliy: {data['mahalliy']} ta\n"
+            text += f"   Import: {data['import']} ta\n"
+            text += f"   Aralash: {data['aralash']} ta\n"
+            text += f"   Aniqlanmagan: {data['aniqlanmagan']} ta\n"
     else:
         text += "\nUchastnik biriktirilgan zayavkalar topilmadi.\n"
 
