@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import threading
 import requests
 from flask import Flask
@@ -41,7 +42,8 @@ def send_message(text):
         text = text[cut:].strip()
         time.sleep(1)
 
-    requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
+    if text:
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
 
 
 def trello_get(path, extra=None):
@@ -53,7 +55,7 @@ def trello_get(path, extra=None):
     r = requests.get(url, params=params, timeout=30)
 
     if r.status_code != 200:
-        print("Trello xato:", r.status_code, r.text[:300])
+        print("Trello xato:", r.status_code, r.text[:500])
         return []
 
     return r.json()
@@ -62,7 +64,9 @@ def trello_get(path, extra=None):
 def get_cards():
     return trello_get(f"boards/{BOARD_ID}/cards", {
         "customFieldItems": "true",
-        "labels": "all"
+        "labels": "all",
+        "members": "true",
+        "pluginData": "true"
     })
 
 
@@ -102,12 +106,39 @@ def build_custom_option_map():
     return option_map
 
 
-def normalize(text):
-    return (text or "").strip().lower()
+def collect_all_text(obj):
+    result = []
+
+    if obj is None:
+        return result
+
+    if isinstance(obj, str):
+        result.append(obj)
+
+        try:
+            parsed = json.loads(obj)
+            result.extend(collect_all_text(parsed))
+        except Exception:
+            pass
+
+        return result
+
+    if isinstance(obj, dict):
+        for value in obj.values():
+            result.extend(collect_all_text(value))
+        return result
+
+    if isinstance(obj, list):
+        for item in obj:
+            result.extend(collect_all_text(item))
+        return result
+
+    result.append(str(obj))
+    return result
 
 
 def detect_type_from_text(text):
-    t = normalize(text)
+    t = (text or "").lower()
 
     if "aralash" in t or "аралаш" in t:
         return "Aralash"
@@ -115,12 +146,7 @@ def detect_type_from_text(text):
     if "import" in t or "импорт" in t:
         return "Import"
 
-    if (
-        "mahalliy" in t
-        or "mahalli" in t
-        or "махаллий" in t
-        or "маҳаллий" in t
-    ):
+    if "mahalliy" in t or "mahalli" in t or "махаллий" in t or "маҳаллий" in t:
         return "Mahalliy"
 
     return None
@@ -137,16 +163,16 @@ def get_card_type(card, option_map):
 
     for item in card.get("customFieldItems", []):
         option_id = item.get("idValue")
-        if option_id and option_id in option_map:
+        if option_id in option_map:
             texts.append(option_map[option_id])
 
         value = item.get("value", {})
         for v in value.values():
             texts.append(str(v))
 
-    joined_text = " ".join(texts)
-    detected = detect_type_from_text(joined_text)
+    texts.extend(collect_all_text(card.get("pluginData", [])))
 
+    detected = detect_type_from_text(" ".join(texts))
     return detected if detected else "Aniqlanmagan"
 
 
@@ -156,11 +182,9 @@ def is_done(list_name):
 
 def is_current_year_card(card):
     year = current_year()
+    all_text = " ".join(collect_all_text(card))
 
-    if year in card.get("name", ""):
-        return True
-
-    if year in card.get("desc", ""):
+    if year in all_text:
         return True
 
     if card.get("due") and card["due"][:4] == year:
@@ -208,6 +232,7 @@ def card_description(card, limit=900):
     desc = card.get("desc", "").strip()
     if not desc:
         return "Opisaniya yozilmagan"
+
     return desc[:limit] + "..." if len(desc) > limit else desc
 
 
@@ -315,7 +340,10 @@ def calculate_stats(filter_type=None):
         cards = [c for c in cards if get_card_type(c, option_map) == filter_type]
 
     total = len(cards)
-    active = done = overdue = no_due = 0
+    active = 0
+    done = 0
+    overdue = 0
+    no_due = 0
 
     type_stats = {
         "Mahalliy": 0,
@@ -385,7 +413,6 @@ def calculate_stats(filter_type=None):
                 employee_stats[name]["aniqlanmagan"] += 1
 
     return {
-        "cards": cards,
         "total": total,
         "active": active,
         "done": done,
@@ -400,11 +427,10 @@ def calculate_stats(filter_type=None):
 def generate_report(filter_type=None):
     s = calculate_stats(filter_type)
 
-    title = f"📊 Xarid bo‘limi hisobot — {current_year()} yil"
+    text = f"📊 Xarid bo‘limi hisobot — {current_year()} yil\n"
     if filter_type:
-        title += f"\n📌 Filtr: {filter_type}"
-
-    text = title + "\n\n"
+        text += f"📌 Filtr: {filter_type}\n"
+    text += "\n"
 
     text += "━━━━━━━━━━━━━━━━━━\n"
     text += "📦 UMUMIY ZAYAVKALAR\n"
@@ -459,22 +485,13 @@ def debug_turi():
     text = "🧪 ZAYAVKA TURI DEBUG\n\n"
     text += f"Custom optionlar soni: {len(option_map)} ta\n\n"
 
-    for card in cards[:10]:
+    for card in cards[:5]:
         detected = get_card_type(card, option_map)
-        values = []
+        all_text = " ".join(collect_all_text(card))[:700]
 
-        for item in card.get("customFieldItems", []):
-            option_id = item.get("idValue")
-            if option_id in option_map:
-                values.append(option_map[option_id])
-
-            value = item.get("value", {})
-            for v in value.values():
-                values.append(str(v))
-
-        text += f"📌 {card.get('name', '')[:80]}\n"
+        text += f"📌 {card.get('name', '')[:100]}\n"
         text += f"Topilgan turi: {detected}\n"
-        text += f"Custom qiymatlar: {values}\n\n"
+        text += f"Matn namunasi:\n{all_text}\n\n"
 
     return text
 
