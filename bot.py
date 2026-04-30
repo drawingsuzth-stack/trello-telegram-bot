@@ -58,6 +58,10 @@ def get_lists():
     return trello_get(f"boards/{BOARD_ID}/lists")
 
 
+def get_members():
+    return trello_get(f"boards/{BOARD_ID}/members")
+
+
 def get_custom_fields():
     return trello_get(f"boards/{BOARD_ID}/customFields")
 
@@ -66,13 +70,20 @@ def build_list_map():
     return {x["id"]: x["name"] for x in get_lists()}
 
 
+def build_member_map():
+    result = {}
+    for member in get_members():
+        result[member["id"]] = member.get("fullName") or member.get("username") or member["id"]
+    return result
+
+
 def build_zayavka_type_map():
     result = {}
 
     for field in get_custom_fields():
         field_name = field.get("name", "").strip().lower()
 
-        if "zayavka turi" in field_name or "заявка turi" in field_name:
+        if "zayavka turi" in field_name:
             for option in field.get("options", []):
                 option_id = option.get("id")
                 option_text = option.get("value", {}).get("text", "")
@@ -119,10 +130,8 @@ def get_card_type(card, type_map):
 
     if "mahalliy" in text:
         return "Mahalliy"
-
     if "import" in text:
         return "Import"
-
     if "aralash" in text:
         return "Aralash"
 
@@ -141,27 +150,21 @@ def due_date(card):
 
 def is_overdue(card, list_name):
     d = due_date(card)
-
     if not d:
         return False
-
     if is_done(list_name):
         return False
-
     return d < datetime.utcnow().date()
 
 
 def is_due_within_5_days(card, list_name):
     d = due_date(card)
-
     if not d:
         return False
-
     if is_done(list_name):
         return False
 
     days_left = (d - datetime.utcnow().date()).days
-
     return 0 <= days_left <= 5
 
 
@@ -240,6 +243,7 @@ def check_trello_changes():
 def generate_report():
     all_cards = get_cards()
     list_map = build_list_map()
+    member_map = build_member_map()
     type_map = build_zayavka_type_map()
 
     cards = [c for c in all_cards if is_current_year_card(c)]
@@ -251,40 +255,60 @@ def generate_report():
     no_due = 0
 
     type_stats = {}
+    column_stats = {}
     employee_stats = {}
 
     for card in cards:
         list_name = list_map.get(card.get("idList"), "Noma’lum ustun")
+        done_status = is_done(list_name)
+        overdue_status = is_overdue(card, list_name)
+        no_due_status = not card.get("due") and not done_status
 
-        if is_done(list_name):
+        if done_status:
             done += 1
         else:
             active += 1
 
-        if is_overdue(card, list_name):
+        if overdue_status:
             overdue += 1
 
-        if not card.get("due") and not is_done(list_name):
+        if no_due_status:
             no_due += 1
 
         card_type = get_card_type(card, type_map)
         type_stats[card_type] = type_stats.get(card_type, 0) + 1
 
-        if not is_done(list_name) and "заявка" not in list_name.lower():
-            if list_name not in employee_stats:
-                employee_stats[list_name] = {
+        if not done_status:
+            if list_name not in column_stats:
+                column_stats[list_name] = 0
+            column_stats[list_name] += 1
+
+        member_ids = card.get("idMembers", [])
+
+        for member_id in member_ids:
+            member_name = member_map.get(member_id, member_id)
+
+            if member_name not in employee_stats:
+                employee_stats[member_name] = {
+                    "total": 0,
                     "active": 0,
+                    "done": 0,
                     "overdue": 0,
                     "no_due": 0
                 }
 
-            employee_stats[list_name]["active"] += 1
+            employee_stats[member_name]["total"] += 1
 
-            if is_overdue(card, list_name):
-                employee_stats[list_name]["overdue"] += 1
+            if done_status:
+                employee_stats[member_name]["done"] += 1
+            else:
+                employee_stats[member_name]["active"] += 1
 
-            if not card.get("due"):
-                employee_stats[list_name]["no_due"] += 1
+            if overdue_status:
+                employee_stats[member_name]["overdue"] += 1
+
+            if no_due_status:
+                employee_stats[member_name]["no_due"] += 1
 
     text = f"📊 Xarid bo‘limi hisobot — {CURRENT_YEAR} yil\n\n"
 
@@ -300,19 +324,30 @@ def generate_report():
     text += "━━━━━━━━━━━━━━━━━━\n"
     text += "📌 ZAYAVKA TURI BO‘YICHA\n"
     text += "━━━━━━━━━━━━━━━━━━\n"
-
     for name, count in sorted(type_stats.items()):
         text += f"{name}: {count} ta\n"
 
     text += "\n━━━━━━━━━━━━━━━━━━\n"
-    text += "👨‍💼 XODIMLAR BO‘YICHA\n"
+    text += "📂 USTUNLAR BO‘YICHA JARAYONDA\n"
+    text += "━━━━━━━━━━━━━━━━━━\n"
+    for name, count in sorted(column_stats.items()):
+        if not is_done(name):
+            text += f"{name}: {count} ta\n"
+
+    text += "\n━━━━━━━━━━━━━━━━━━\n"
+    text += "👨‍💼 XODIMLAR BO‘YICHA ISHTIROK\n"
     text += "━━━━━━━━━━━━━━━━━━\n"
 
-    for employee, data in sorted(employee_stats.items()):
-        text += f"\n🔹 {employee}\n"
-        text += f"   Jarayonda: {data['active']} ta\n"
-        text += f"   Kechikkan: {data['overdue']} ta\n"
-        text += f"   Muddatsiz: {data['no_due']} ta\n"
+    if employee_stats:
+        for employee, data in sorted(employee_stats.items()):
+            text += f"\n🔹 {employee}\n"
+            text += f"   Ishtirok etayotgan jami: {data['total']} ta\n"
+            text += f"   Jarayonda: {data['active']} ta\n"
+            text += f"   Yopilgan: {data['done']} ta\n"
+            text += f"   Kechikkan: {data['overdue']} ta\n"
+            text += f"   Muddatsiz: {data['no_due']} ta\n"
+    else:
+        text += "\nUchastnik biriktirilgan zayavkalar topilmadi.\n"
 
     return text
 
@@ -325,7 +360,6 @@ def get_latest_update_id():
         ).json()
 
         updates = result.get("result", [])
-
         if not updates:
             return None
 
