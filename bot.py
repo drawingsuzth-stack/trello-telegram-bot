@@ -9,7 +9,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 TRELLO_KEY = os.getenv("TRELLO_KEY")
 TRELLO_TOKEN = os.getenv("TRELLO_TOKEN")
-BOARD_ID = os.getenv("BOARD_ID")
+BOARD_ID = os.getenv("BOARD_ID", "62062d5559dff006768982bd")
 
 DONE_LIST_NAME = "YOPILGAN"
 CHECK_INTERVAL = 10
@@ -39,22 +39,22 @@ def get_updates():
     return requests.get(url, params=params, timeout=20).json().get("result", [])
 
 
-def trello_params():
-    return {"key": TRELLO_KEY, "token": TRELLO_TOKEN}
+def trello_get(endpoint, extra=None):
+    params = {"key": TRELLO_KEY, "token": TRELLO_TOKEN}
+    if extra:
+        params.update(extra)
 
+    r = requests.get(endpoint, params=params, timeout=30)
 
-def trello_get(url, params=None):
-    final_params = trello_params()
-    if params:
-        final_params.update(params)
-
-    response = requests.get(url, params=final_params, timeout=30)
-
-    if response.status_code != 200:
-        print("Trello API xato:", response.status_code, response.text[:300])
+    if r.status_code != 200:
+        print("Trello API xato:", r.status_code, r.text[:300])
         return []
 
-    return response.json()
+    try:
+        return r.json()
+    except Exception as e:
+        print("JSON xato:", e, r.text[:300])
+        return []
 
 
 def get_cards():
@@ -63,18 +63,15 @@ def get_cards():
 
 
 def get_lists():
-    url = f"https://api.trello.com/1/boards/{BOARD_ID}/lists"
-    return trello_get(url)
+    return trello_get(f"https://api.trello.com/1/boards/{BOARD_ID}/lists")
 
 
 def get_members():
-    url = f"https://api.trello.com/1/boards/{BOARD_ID}/members"
-    return trello_get(url)
+    return trello_get(f"https://api.trello.com/1/boards/{BOARD_ID}/members")
 
 
 def get_custom_fields():
-    url = f"https://api.trello.com/1/boards/{BOARD_ID}/customFields"
-    return trello_get(url)
+    return trello_get(f"https://api.trello.com/1/boards/{BOARD_ID}/customFields")
 
 
 def build_list_map():
@@ -103,41 +100,43 @@ def build_custom_field_options_map():
     return options_map
 
 
-def card_created_year(card_id):
-    try:
-        return datetime.fromtimestamp(int(card_id[:8], 16)).year
-    except Exception:
-        return None
-
-
 def is_current_year_card(card):
-    return card_created_year(card["id"]) == datetime.now().year
+    year = str(datetime.now().year)
+
+    if card.get("due"):
+        try:
+            due_year = str(datetime.fromisoformat(card["due"].replace("Z", "")).year)
+            if due_year == year:
+                return True
+        except Exception:
+            pass
+
+    return year in card.get("name", "")
 
 
 def get_card_type(card, options_map):
-    for label in card.get("labels", []):
-        name = label.get("name", "").lower()
+    text_all = card.get("name", "").lower()
 
-        if "aralash" in name:
-            return "aralash"
-        if "import" in name:
-            return "import"
-        if "mahalliy" in name:
-            return "mahalliy"
+    for label in card.get("labels", []):
+        text_all += " " + label.get("name", "").lower()
 
     for item in card.get("customFieldItems", []):
-        value = options_map.get(item.get("idValue"), "")
-        text_value = item.get("value", {}).get("text", "").lower()
-        combined = f"{value} {text_value}"
+        text_all += " " + options_map.get(item.get("idValue"), "")
+        text_all += " " + item.get("value", {}).get("text", "").lower()
 
-        if "aralash" in combined:
-            return "aralash"
-        if "import" in combined:
-            return "import"
-        if "mahalliy" in combined:
-            return "mahalliy"
+    if "aralash" in text_all:
+        return "aralash"
+    if "import" in text_all or "импорт" in text_all:
+        return "import"
+    if "mahalliy" in text_all or "махаллий" in text_all or "mahalli" in text_all:
+        return "mahalliy"
 
     return None
+
+
+def is_done_card(card, list_map):
+    list_name = list_map.get(card["idList"], "")
+    return list_name.strip().upper() == DONE_LIST_NAME
 
 
 def initialize_existing_cards():
@@ -171,8 +170,7 @@ def generate_report():
     per_member = {}
 
     for card in cards:
-        list_name = list_map.get(card["idList"], "")
-        is_done = list_name.upper() == DONE_LIST_NAME
+        is_done = is_done_card(card, list_map)
 
         if is_done:
             done += 1
@@ -235,18 +233,13 @@ def generate_type_report(type_name):
     options_map = build_custom_field_options_map()
     now = datetime.utcnow()
 
-    total = 0
-    done = 0
-    active = 0
-    overdue = 0
-    no_due = 0
+    total = done = active = overdue = no_due = 0
 
     for card in cards:
         if get_card_type(card, options_map) != type_name:
             continue
 
-        list_name = list_map.get(card["idList"], "")
-        is_done = list_name.upper() == DONE_LIST_NAME
+        is_done = is_done_card(card, list_map)
 
         total += 1
 
@@ -296,20 +289,15 @@ def check_changes():
         card_name = card["name"]
         list_name = list_map.get(card["idList"], "")
         old_list = old_cards.get(card_id)
-
         current_cards[card_id] = list_name
 
         if not is_current_year_card(card):
             continue
 
-        if card_id not in old_cards and list_name.upper() != DONE_LIST_NAME:
-            send_message(
-                f"🆕 Yangi zayavka\n\n"
-                f"📌 {card_name}\n"
-                f"📂 Ustun: {list_name}"
-            )
+        if card_id not in old_cards and list_name.strip().upper() != DONE_LIST_NAME:
+            send_message(f"🆕 Yangi zayavka\n\n📌 {card_name}\n📂 Ustun: {list_name}")
 
-        elif old_list and old_list.upper() != DONE_LIST_NAME and list_name.upper() == DONE_LIST_NAME:
+        elif old_list and old_list.strip().upper() != DONE_LIST_NAME and list_name.strip().upper() == DONE_LIST_NAME:
             send_message(
                 f"✅ Zayavka yopildi\n\n"
                 f"📌 {card_name}\n"
@@ -317,17 +305,13 @@ def check_changes():
                 f"📂 Hozirgi ustun: {list_name}"
             )
 
-        if not card.get("due") and list_name.upper() != DONE_LIST_NAME:
+        if not card.get("due") and list_name.strip().upper() != DONE_LIST_NAME:
             key = f"{card_id}_nodue"
             if key not in notified_alerts:
-                send_message(
-                    f"⚠️ Muddat qo‘yilmagan zayavka\n\n"
-                    f"📌 {card_name}\n"
-                    f"📂 Ustun: {list_name}"
-                )
+                send_message(f"⚠️ Muddat qo‘yilmagan zayavka\n\n📌 {card_name}\n📂 Ustun: {list_name}")
                 notified_alerts.add(key)
 
-        if card.get("due") and list_name.upper() != DONE_LIST_NAME:
+        if card.get("due") and list_name.strip().upper() != DONE_LIST_NAME:
             try:
                 due_dt = datetime.fromisoformat(card["due"].replace("Z", ""))
                 diff = due_dt - now
@@ -335,21 +319,13 @@ def check_changes():
                 if timedelta(hours=0) < diff <= timedelta(days=1):
                     key = f"{card_id}_soon"
                     if key not in notified_alerts:
-                        send_message(
-                            f"⚠️ Zayavka muddati yaqin\n\n"
-                            f"📌 {card_name}\n"
-                            f"📂 Ustun: {list_name}"
-                        )
+                        send_message(f"⚠️ Zayavka muddati yaqin\n\n📌 {card_name}\n📂 Ustun: {list_name}")
                         notified_alerts.add(key)
 
                 if diff <= timedelta(hours=0):
                     key = f"{card_id}_overdue"
                     if key not in notified_alerts:
-                        send_message(
-                            f"⛔ Zayavka muddati o‘tgan\n\n"
-                            f"📌 {card_name}\n"
-                            f"📂 Ustun: {list_name}"
-                        )
+                        send_message(f"⛔ Zayavka muddati o‘tgan\n\n📌 {card_name}\n📂 Ustun: {list_name}")
                         notified_alerts.add(key)
 
             except Exception:
@@ -363,25 +339,20 @@ def handle_commands():
 
     for update in get_updates():
         last_update_id = update["update_id"] + 1
-
         text = update.get("message", {}).get("text", "").strip().lower()
 
         if text in ["/hisobot", "hisobot"]:
             send_message(generate_report())
-
         elif text in ["/mahalliy", "mahalliy"]:
             send_message(generate_type_report("mahalliy"))
-
         elif text in ["/import", "import"]:
             send_message(generate_type_report("import"))
-
         elif text in ["/aralash", "aralash"]:
             send_message(generate_type_report("aralash"))
 
 
 def bot_loop():
     print("✅ Bot ishga tushdi.")
-
     initialize_existing_cards()
 
     while True:
