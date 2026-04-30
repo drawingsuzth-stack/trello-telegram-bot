@@ -12,7 +12,6 @@ TRELLO_TOKEN = os.getenv("TRELLO_TOKEN")
 BOARD_ID = os.getenv("BOARD_ID")
 
 DONE_LIST_NAME = "YOPILGAN"
-CURRENT_YEAR = str(datetime.now().year)
 CHECK_INTERVAL = 30
 
 app = Flask(__name__)
@@ -27,27 +26,22 @@ def home():
     return "Bot ishlayapti ✅"
 
 
+def current_year():
+    return str(datetime.now().year)
+
+
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    if len(text) <= 3900:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
-        return
-
-    parts = []
     while len(text) > 3900:
-        split_at = text.rfind("\n", 0, 3900)
-        if split_at == -1:
-            split_at = 3900
-        parts.append(text[:split_at])
-        text = text[split_at:].strip()
-
-    if text:
-        parts.append(text)
-
-    for part in parts:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": part}, timeout=30)
+        cut = text.rfind("\n", 0, 3900)
+        if cut == -1:
+            cut = 3900
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text[:cut]}, timeout=30)
+        text = text[cut:].strip()
         time.sleep(1)
+
+    requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
 
 
 def trello_get(path, extra=None):
@@ -89,25 +83,71 @@ def build_list_map():
 
 
 def build_member_map():
-    result = {}
-    for member in get_members():
-        result[member["id"]] = member.get("fullName") or member.get("username") or member["id"]
-    return result
+    return {
+        m["id"]: m.get("fullName") or m.get("username") or m["id"]
+        for m in get_members()
+    }
 
 
-def build_zayavka_type_map():
-    result = {}
+def build_custom_option_map():
+    option_map = {}
 
     for field in get_custom_fields():
-        field_name = field.get("name", "").strip().lower()
+        for opt in field.get("options", []):
+            opt_id = opt.get("id")
+            opt_text = opt.get("value", {}).get("text", "")
+            if opt_id and opt_text:
+                option_map[opt_id] = opt_text
 
-        if "zayavka turi" in field_name or "заявка turi" in field_name:
-            for option in field.get("options", []):
-                option_id = option.get("id")
-                option_text = option.get("value", {}).get("text", "")
-                result[option_id] = option_text
+    return option_map
 
-    return result
+
+def normalize(text):
+    return (text or "").strip().lower()
+
+
+def detect_type_from_text(text):
+    t = normalize(text)
+
+    if "aralash" in t or "аралаш" in t:
+        return "Aralash"
+
+    if "import" in t or "импорт" in t:
+        return "Import"
+
+    if (
+        "mahalliy" in t
+        or "mahalli" in t
+        or "махаллий" in t
+        or "маҳаллий" in t
+    ):
+        return "Mahalliy"
+
+    return None
+
+
+def get_card_type(card, option_map):
+    texts = []
+
+    texts.append(card.get("name", ""))
+    texts.append(card.get("desc", ""))
+
+    for label in card.get("labels", []):
+        texts.append(label.get("name", ""))
+
+    for item in card.get("customFieldItems", []):
+        option_id = item.get("idValue")
+        if option_id and option_id in option_map:
+            texts.append(option_map[option_id])
+
+        value = item.get("value", {})
+        for v in value.values():
+            texts.append(str(v))
+
+    joined_text = " ".join(texts)
+    detected = detect_type_from_text(joined_text)
+
+    return detected if detected else "Aniqlanmagan"
 
 
 def is_done(list_name):
@@ -115,45 +155,18 @@ def is_done(list_name):
 
 
 def is_current_year_card(card):
-    name = card.get("name", "")
-    desc = card.get("desc", "")
+    year = current_year()
 
-    if CURRENT_YEAR in name:
+    if year in card.get("name", ""):
         return True
 
-    if CURRENT_YEAR in desc:
+    if year in card.get("desc", ""):
         return True
 
-    if card.get("due"):
-        return card["due"][:4] == CURRENT_YEAR
+    if card.get("due") and card["due"][:4] == year:
+        return True
 
     return False
-
-
-def get_card_type(card, type_map):
-    text = card.get("name", "").lower()
-    text += " " + card.get("desc", "").lower()
-
-    for label in card.get("labels", []):
-        text += " " + label.get("name", "").lower()
-
-    for item in card.get("customFieldItems", []):
-        option_id = item.get("idValue")
-        if option_id in type_map:
-            return type_map[option_id]
-
-        value_text = item.get("value", {}).get("text", "")
-        if value_text:
-            text += " " + value_text.lower()
-
-    if "mahalliy" in text:
-        return "Mahalliy"
-    if "import" in text:
-        return "Import"
-    if "aralash" in text:
-        return "Aralash"
-
-    return "Aniqlanmagan"
 
 
 def due_date(card):
@@ -168,9 +181,7 @@ def due_date(card):
 
 def due_text(card):
     d = due_date(card)
-    if not d:
-        return "Muddat qo‘yilmagan"
-    return d.strftime("%d.%m.%Y")
+    return d.strftime("%d.%m.%Y") if d else "Muddat qo‘yilmagan"
 
 
 def is_overdue(card, list_name):
@@ -197,11 +208,7 @@ def card_description(card, limit=900):
     desc = card.get("desc", "").strip()
     if not desc:
         return "Opisaniya yozilmagan"
-
-    if len(desc) > limit:
-        return desc[:limit] + "..."
-
-    return desc
+    return desc[:limit] + "..." if len(desc) > limit else desc
 
 
 def card_short_url(card):
@@ -209,15 +216,8 @@ def card_short_url(card):
 
 
 def member_names(card, member_map):
-    names = []
-
-    for member_id in card.get("idMembers", []):
-        names.append(member_map.get(member_id, member_id))
-
-    if not names:
-        return "Uchastnik biriktirilmagan"
-
-    return ", ".join(names)
+    names = [member_map.get(mid, mid) for mid in card.get("idMembers", [])]
+    return ", ".join(names) if names else "Uchastnik biriktirilmagan"
 
 
 def initialize_known_cards():
@@ -238,7 +238,7 @@ def check_trello_changes():
     cards = get_cards()
     list_map = build_list_map()
     member_map = build_member_map()
-    type_map = build_zayavka_type_map()
+    option_map = build_custom_option_map()
 
     new_known = {}
 
@@ -250,7 +250,7 @@ def check_trello_changes():
         card_name = card.get("name", "Nomsiz karta")
         list_name = list_map.get(card.get("idList"), "Noma’lum ustun")
         old_list = known_cards.get(card_id)
-        zayavka_type = get_card_type(card, type_map)
+        zayavka_type = get_card_type(card, option_map)
 
         new_known[card_id] = list_name
 
@@ -303,19 +303,19 @@ def check_trello_changes():
     known_cards.update(new_known)
 
 
-def generate_report():
+def calculate_stats(filter_type=None):
     all_cards = get_cards()
     list_map = build_list_map()
     member_map = build_member_map()
-    type_map = build_zayavka_type_map()
+    option_map = build_custom_option_map()
 
     cards = [c for c in all_cards if is_current_year_card(c)]
 
+    if filter_type:
+        cards = [c for c in cards if get_card_type(c, option_map) == filter_type]
+
     total = len(cards)
-    active = 0
-    done = 0
-    overdue = 0
-    no_due = 0
+    active = done = overdue = no_due = 0
 
     type_stats = {
         "Mahalliy": 0,
@@ -332,6 +332,7 @@ def generate_report():
         done_status = is_done(list_name)
         overdue_status = is_overdue(card, list_name)
         no_due_status = not card.get("due") and not done_status
+        card_type = get_card_type(card, option_map)
 
         if done_status:
             done += 1
@@ -344,19 +345,16 @@ def generate_report():
         if no_due_status:
             no_due += 1
 
-        card_type = get_card_type(card, type_map)
-        if card_type not in type_stats:
-            type_stats[card_type] = 0
-        type_stats[card_type] += 1
+        type_stats[card_type] = type_stats.get(card_type, 0) + 1
 
         if not done_status:
             column_stats[list_name] = column_stats.get(list_name, 0) + 1
 
         for member_id in card.get("idMembers", []):
-            member_name = member_map.get(member_id, member_id)
+            name = member_map.get(member_id, member_id)
 
-            if member_name not in employee_stats:
-                employee_stats[member_name] = {
+            if name not in employee_stats:
+                employee_stats[name] = {
                     "total": 0,
                     "active": 0,
                     "done": 0,
@@ -368,53 +366,67 @@ def generate_report():
                     "aniqlanmagan": 0
                 }
 
-            employee_stats[member_name]["total"] += 1
-
-            if done_status:
-                employee_stats[member_name]["done"] += 1
-            else:
-                employee_stats[member_name]["active"] += 1
+            employee_stats[name]["total"] += 1
+            employee_stats[name]["done" if done_status else "active"] += 1
 
             if overdue_status:
-                employee_stats[member_name]["overdue"] += 1
+                employee_stats[name]["overdue"] += 1
 
             if no_due_status:
-                employee_stats[member_name]["no_due"] += 1
+                employee_stats[name]["no_due"] += 1
 
-            t = card_type.lower()
-            if "mahalliy" in t:
-                employee_stats[member_name]["mahalliy"] += 1
-            elif "import" in t:
-                employee_stats[member_name]["import"] += 1
-            elif "aralash" in t:
-                employee_stats[member_name]["aralash"] += 1
+            if card_type == "Mahalliy":
+                employee_stats[name]["mahalliy"] += 1
+            elif card_type == "Import":
+                employee_stats[name]["import"] += 1
+            elif card_type == "Aralash":
+                employee_stats[name]["aralash"] += 1
             else:
-                employee_stats[member_name]["aniqlanmagan"] += 1
+                employee_stats[name]["aniqlanmagan"] += 1
 
-    text = f"📊 Xarid bo‘limi hisobot — {CURRENT_YEAR} yil\n\n"
+    return {
+        "cards": cards,
+        "total": total,
+        "active": active,
+        "done": done,
+        "overdue": overdue,
+        "no_due": no_due,
+        "type_stats": type_stats,
+        "column_stats": column_stats,
+        "employee_stats": employee_stats
+    }
+
+
+def generate_report(filter_type=None):
+    s = calculate_stats(filter_type)
+
+    title = f"📊 Xarid bo‘limi hisobot — {current_year()} yil"
+    if filter_type:
+        title += f"\n📌 Filtr: {filter_type}"
+
+    text = title + "\n\n"
 
     text += "━━━━━━━━━━━━━━━━━━\n"
     text += "📦 UMUMIY ZAYAVKALAR\n"
     text += "━━━━━━━━━━━━━━━━━━\n"
-    text += f"Jami: {total} ta\n"
-    text += f"Jarayonda: {active} ta\n"
-    text += f"Yopilgan: {done} ta\n"
-    text += f"Kechikkan: {overdue} ta\n"
-    text += f"Muddatsiz: {no_due} ta\n\n"
+    text += f"Jami: {s['total']} ta\n"
+    text += f"Jarayonda: {s['active']} ta\n"
+    text += f"Yopilgan: {s['done']} ta\n"
+    text += f"Kechikkan: {s['overdue']} ta\n"
+    text += f"Muddatsiz: {s['no_due']} ta\n\n"
 
     text += "━━━━━━━━━━━━━━━━━━\n"
     text += "📌 ZAYAVKA TURI BO‘YICHA\n"
     text += "━━━━━━━━━━━━━━━━━━\n"
-    text += f"Mahalliy: {type_stats.get('Mahalliy', 0)} ta\n"
-    text += f"Import: {type_stats.get('Import', 0)} ta\n"
-    text += f"Aralash: {type_stats.get('Aralash', 0)} ta\n"
-    text += f"Aniqlanmagan: {type_stats.get('Aniqlanmagan', 0)} ta\n\n"
+    text += f"Mahalliy: {s['type_stats'].get('Mahalliy', 0)} ta\n"
+    text += f"Import: {s['type_stats'].get('Import', 0)} ta\n"
+    text += f"Aralash: {s['type_stats'].get('Aralash', 0)} ta\n"
+    text += f"Aniqlanmagan: {s['type_stats'].get('Aniqlanmagan', 0)} ta\n\n"
 
     text += "━━━━━━━━━━━━━━━━━━\n"
     text += "📂 USTUNLAR BO‘YICHA JARAYONDA\n"
     text += "━━━━━━━━━━━━━━━━━━\n"
-
-    for name, count in sorted(column_stats.items()):
+    for name, count in sorted(s["column_stats"].items()):
         if not is_done(name):
             text += f"{name}: {count} ta\n"
 
@@ -422,8 +434,8 @@ def generate_report():
     text += "👨‍💼 XODIMLAR BO‘YICHA ISHTIROK\n"
     text += "━━━━━━━━━━━━━━━━━━\n"
 
-    if employee_stats:
-        for employee, data in sorted(employee_stats.items()):
+    if s["employee_stats"]:
+        for employee, data in sorted(s["employee_stats"].items()):
             text += f"\n🔹 {employee}\n"
             text += f"   Ishtirok jami: {data['total']} ta\n"
             text += f"   Jarayonda: {data['active']} ta\n"
@@ -440,6 +452,33 @@ def generate_report():
     return text
 
 
+def debug_turi():
+    cards = [c for c in get_cards() if is_current_year_card(c)]
+    option_map = build_custom_option_map()
+
+    text = "🧪 ZAYAVKA TURI DEBUG\n\n"
+    text += f"Custom optionlar soni: {len(option_map)} ta\n\n"
+
+    for card in cards[:10]:
+        detected = get_card_type(card, option_map)
+        values = []
+
+        for item in card.get("customFieldItems", []):
+            option_id = item.get("idValue")
+            if option_id in option_map:
+                values.append(option_map[option_id])
+
+            value = item.get("value", {})
+            for v in value.values():
+                values.append(str(v))
+
+        text += f"📌 {card.get('name', '')[:80]}\n"
+        text += f"Topilgan turi: {detected}\n"
+        text += f"Custom qiymatlar: {values}\n\n"
+
+    return text
+
+
 def get_latest_update_id():
     try:
         result = requests.get(
@@ -448,11 +487,7 @@ def get_latest_update_id():
         ).json()
 
         updates = result.get("result", [])
-        if not updates:
-            return None
-
-        return updates[-1]["update_id"]
-
+        return updates[-1]["update_id"] if updates else None
     except Exception:
         return None
 
@@ -461,7 +496,6 @@ def handle_telegram_commands():
     global last_update_id
 
     params = {"timeout": 20}
-
     if last_update_id is not None:
         params["offset"] = last_update_id + 1
 
@@ -472,8 +506,7 @@ def handle_telegram_commands():
     ).json()
 
     for update in result.get("result", []):
-        update_id = update["update_id"]
-        last_update_id = update_id
+        last_update_id = update["update_id"]
 
         message = update.get("message", {})
         chat_id = str(message.get("chat", {}).get("id", ""))
@@ -484,6 +517,18 @@ def handle_telegram_commands():
 
         if text in ["/hisobot", "hisobot"]:
             send_message(generate_report())
+
+        elif text in ["/mahalliy", "mahalliy"]:
+            send_message(generate_report("Mahalliy"))
+
+        elif text in ["/import", "import"]:
+            send_message(generate_report("Import"))
+
+        elif text in ["/aralash", "aralash"]:
+            send_message(generate_report("Aralash"))
+
+        elif text in ["/debug_turi", "debug_turi"]:
+            send_message(debug_turi())
 
 
 def bot_loop():
