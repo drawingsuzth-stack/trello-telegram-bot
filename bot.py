@@ -5,11 +5,11 @@ import requests
 from flask import Flask
 from datetime import datetime, timedelta
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-TRELLO_KEY = os.getenv("TRELLO_KEY")
-TRELLO_TOKEN = os.getenv("TRELLO_TOKEN")
-BOARD_ID = os.getenv("BOARD_ID")
+BOT_TOKEN = os.getenv("8717622332:AAFVshiMWLkQL_LB24VuWLhW51qXhHn-qj4")
+CHAT_ID = os.getenv("-1003908412363")
+TRELLO_KEY = os.getenv("6ca88f5a985a209852bcf9eae6f6c6c5")
+TRELLO_TOKEN = os.getenv("ATTAb8ec71a6c12dbc366f8ba6e4f21ef0ce0b48c890d80fd272c8ca1de7d065247143CCD020")
+BOARD_ID = os.getenv("6802a865955f066f028888bd")
 
 DONE_LIST_NAME = "YOPILGAN"
 CHECK_INTERVAL = 10
