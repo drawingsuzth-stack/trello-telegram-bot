@@ -12,9 +12,9 @@ TRELLO_TOKEN = os.getenv("TRELLO_TOKEN")
 BOARD_ID = os.getenv("BOARD_ID")
 
 DONE_LIST_NAME = "YOPILGAN"
+CURRENT_YEAR = str(datetime.now().year)
 
 app = Flask(__name__)
-
 processed_updates = set()
 
 
@@ -23,24 +23,13 @@ def home():
     return "Bot ishlayapti ✅"
 
 
-def telegram_api(method, data=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    return requests.post(url, data=data, timeout=30).json()
-
-
 def send_message(text):
-    telegram_api("sendMessage", {
-        "chat_id": CHAT_ID,
-        "text": text
-    })
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
 
 
 def trello_get(path, extra=None):
-    params = {
-        "key": TRELLO_KEY,
-        "token": TRELLO_TOKEN
-    }
-
+    params = {"key": TRELLO_KEY, "token": TRELLO_TOKEN}
     if extra:
         params.update(extra)
 
@@ -48,6 +37,7 @@ def trello_get(path, extra=None):
     response = requests.get(url, params=params, timeout=30)
 
     if response.status_code != 200:
+        print("Trello xato:", response.status_code, response.text[:300])
         return []
 
     return response.json()
@@ -64,16 +54,29 @@ def get_lists():
     return trello_get(f"boards/{BOARD_ID}/lists")
 
 
-def get_board_data():
-    cards = get_cards()
-    lists = get_lists()
-
-    list_map = {item["id"]: item["name"] for item in lists}
-    return cards, list_map
-
-
 def is_done(list_name):
     return list_name.strip().upper() == DONE_LIST_NAME
+
+
+def is_current_year_card(card):
+    name = card.get("name", "")
+    desc = card.get("desc", "")
+
+    if CURRENT_YEAR in name:
+        return True
+
+    if CURRENT_YEAR in desc:
+        return True
+
+    if card.get("due"):
+        try:
+            due_year = card["due"][:4]
+            if due_year == CURRENT_YEAR:
+                return True
+        except Exception:
+            pass
+
+    return False
 
 
 def is_overdue(card, list_name):
@@ -92,16 +95,15 @@ def is_overdue(card, list_name):
 
 def get_card_type(card):
     text = card.get("name", "").lower()
+    text += " " + card.get("desc", "").lower()
 
     for label in card.get("labels", []):
         text += " " + label.get("name", "").lower()
 
     if "mahalliy" in text:
         return "Mahalliy"
-
     if "import" in text:
         return "Import"
-
     if "aralash" in text:
         return "Aralash"
 
@@ -109,7 +111,12 @@ def get_card_type(card):
 
 
 def generate_report():
-    cards, list_map = get_board_data()
+    all_cards = get_cards()
+    lists = get_lists()
+
+    list_map = {item["id"]: item["name"] for item in lists}
+
+    cards = [card for card in all_cards if is_current_year_card(card)]
 
     total = len(cards)
     done_count = 0
@@ -153,7 +160,7 @@ def generate_report():
             if not card.get("due"):
                 employee_stats[list_name]["no_due"] += 1
 
-    text = "📊 Xarid bo‘limi hisobot\n\n"
+    text = f"📊 Xarid bo‘limi hisobot — {CURRENT_YEAR} yil\n\n"
 
     text += "━━━━━━━━━━━━━━━━━━\n"
     text += "📦 UMUMIY ZAYAVKALAR\n"
@@ -192,12 +199,10 @@ def get_latest_update_id():
         ).json()
 
         updates = result.get("result", [])
-
         if not updates:
             return None
 
         return updates[-1]["update_id"]
-
     except Exception:
         return None
 
@@ -207,9 +212,7 @@ def bot_loop():
 
     while True:
         try:
-            params = {
-                "timeout": 20
-            }
+            params = {"timeout": 20}
 
             if last_update_id is not None:
                 params["offset"] = last_update_id + 1
