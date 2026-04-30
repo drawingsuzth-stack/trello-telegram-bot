@@ -9,7 +9,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 app = Flask(__name__)
 
-@app.route("/")
+@app.route('/')
 def home():
     return "Bot ishlayapti!"
 
@@ -29,23 +29,21 @@ def bot_loop():
         if last_update_id:
             url += f"?offset={last_update_id + 1}"
 
-        res = requests.get(url).json()
+        response = requests.get(url).json()
 
-        if res["result"]:
-            for update in res["result"]:
-                last_update_id = update["update_id"]
+        for update in response["result"]:
+            last_update_id = update["update_id"]
 
-                if "message" in update:
-                    text = update["message"].get("text", "")
+            if "message" in update:
+                text = update["message"].get("text", "")
 
-                    if text == "/hisobot":
-                        send_message("Bot ishlayapti ✅")
+                if text == "/hisobot":
+                    send_message("Bot ishlayapti ✅")
 
         time.sleep(2)
 
 if __name__ == "__main__":
-    t = threading.Thread(target=bot_loop)
-    t.start()
+    threading.Thread(target=bot_loop).start()
 
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
