@@ -1,11 +1,10 @@
 import os
 import re
 import time
-import json
 import threading
 import requests
 from flask import Flask
-from datetime import datetime, timedelta
+from datetime import datetime
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = str(os.getenv("CHAT_ID"))
@@ -17,11 +16,9 @@ DONE_LIST_NAME = "YOPILGAN"
 CHECK_INTERVAL = 30
 
 app = Flask(__name__)
-
 last_update_id = None
 known_cards = {}
 warned_5_days = set()
-plugin_cache = {}
 
 
 @app.route("/")
@@ -35,7 +32,6 @@ def current_year():
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     while len(text) > 3900:
         cut = text.rfind("\n", 0, 3900)
         if cut == -1:
@@ -43,36 +39,26 @@ def send_message(text):
         requests.post(url, data={"chat_id": CHAT_ID, "text": text[:cut]}, timeout=30)
         text = text[cut:].strip()
         time.sleep(1)
-
     if text:
         requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=30)
 
 
 def trello_get(path, extra=None):
     params = {"key": TRELLO_KEY, "token": TRELLO_TOKEN}
-
     if extra:
         params.update(extra)
-
-    url = f"https://api.trello.com/1/{path}"
-    r = requests.get(url, params=params, timeout=30)
-
+    r = requests.get(f"https://api.trello.com/1/{path}", params=params, timeout=30)
     if r.status_code != 200:
         print("Trello xato:", r.status_code, r.text[:500])
         return []
-
-    try:
-        return r.json()
-    except Exception:
-        return []
+    return r.json()
 
 
 def get_cards():
     return trello_get(f"boards/{BOARD_ID}/cards", {
-        "customFieldItems": "true",
         "labels": "all",
         "members": "true",
-        "pluginData": "true"
+        "customFieldItems": "true"
     })
 
 
@@ -82,24 +68,6 @@ def get_lists():
 
 def get_members():
     return trello_get(f"boards/{BOARD_ID}/members")
-
-
-def get_custom_fields():
-    return trello_get(f"boards/{BOARD_ID}/customFields")
-
-
-def get_card_plugin_data(card_id):
-    now = time.time()
-
-    if card_id in plugin_cache:
-        saved_time, saved_data = plugin_cache[card_id]
-        if now - saved_time < 300:
-            return saved_data
-
-    data = trello_get(f"cards/{card_id}/pluginData")
-    plugin_cache[card_id] = (now, data)
-
-    return data
 
 
 def build_list_map():
@@ -113,56 +81,14 @@ def build_member_map():
     }
 
 
-def build_custom_option_map():
-    option_map = {}
-
-    for field in get_custom_fields():
-        for opt in field.get("options", []):
-            opt_id = opt.get("id")
-            opt_text = opt.get("value", {}).get("text", "")
-
-            if opt_id and opt_text:
-                option_map[opt_id] = opt_text
-
-    return option_map
+def normalize(text):
+    return (text or "").strip().lower()
 
 
-def collect_all_text(obj):
-    result = []
+def detect_type(text):
+    t = normalize(text)
 
-    if obj is None:
-        return result
-
-    if isinstance(obj, str):
-        result.append(obj)
-
-        try:
-            parsed = json.loads(obj)
-            result.extend(collect_all_text(parsed))
-        except Exception:
-            pass
-
-        return result
-
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            result.append(str(key))
-            result.extend(collect_all_text(value))
-        return result
-
-    if isinstance(obj, list):
-        for item in obj:
-            result.extend(collect_all_text(item))
-        return result
-
-    result.append(str(obj))
-    return result
-
-
-def detect_type_from_text(text):
-    t = (text or "").lower()
-
-    if "aralash" in t or "аралаш" in t or "смеш" in t:
+    if "aralash" in t or "аралаш" in t:
         return "Aralash"
 
     if "import" in t or "импорт" in t:
@@ -171,6 +97,8 @@ def detect_type_from_text(text):
     if (
         "mahalliy" in t
         or "mahalli" in t
+        or "maxalliy" in t
+        or "maxalli" in t
         or "махаллий" in t
         or "маҳаллий" in t
         or "local" in t
@@ -180,33 +108,25 @@ def detect_type_from_text(text):
     return None
 
 
-def get_card_type(card, option_map):
-    texts = []
-
-    texts.append(card.get("name", ""))
-    texts.append(card.get("desc", ""))
+def get_card_type(card):
+    label_texts = []
 
     for label in card.get("labels", []):
-        texts.append(label.get("name", ""))
+        label_texts.append(label.get("name", ""))
 
-    for item in card.get("customFieldItems", []):
-        option_id = item.get("idValue")
+    label_joined = " ".join(label_texts)
+    from_label = detect_type(label_joined)
 
-        if option_id in option_map:
-            texts.append(option_map[option_id])
+    if from_label:
+        return from_label
 
-        value = item.get("value", {})
-        texts.extend(collect_all_text(value))
+    full_text = card.get("name", "") + " " + card.get("desc", "")
+    from_text = detect_type(full_text)
 
-    texts.extend(collect_all_text(card.get("pluginData", [])))
+    if from_text:
+        return from_text
 
-    plugin_data = get_card_plugin_data(card["id"])
-    texts.extend(collect_all_text(plugin_data))
-
-    joined = " ".join(texts)
-    detected = detect_type_from_text(joined)
-
-    return detected if detected else "Aniqlanmagan"
+    return "Aniqlanmagan"
 
 
 def is_done(list_name):
@@ -219,12 +139,10 @@ def is_current_year_card(card):
     desc = card.get("desc", "")
 
     years_in_name = re.findall(r"20\d{2}", name)
-
     if years_in_name:
         return year in years_in_name
 
     years_in_desc = re.findall(r"20\d{2}", desc)
-
     if years_in_desc:
         return year in years_in_desc
 
@@ -237,7 +155,6 @@ def is_current_year_card(card):
 def due_date(card):
     if not card.get("due"):
         return None
-
     try:
         return datetime.strptime(card["due"][:10], "%Y-%m-%d").date()
     except Exception:
@@ -251,35 +168,23 @@ def due_text(card):
 
 def is_overdue(card, list_name):
     d = due_date(card)
-
-    if not d:
+    if not d or is_done(list_name):
         return False
-
-    if is_done(list_name):
-        return False
-
     return d < datetime.utcnow().date()
 
 
 def is_due_within_5_days(card, list_name):
     d = due_date(card)
-
-    if not d:
+    if not d or is_done(list_name):
         return False
-
-    if is_done(list_name):
-        return False
-
     days_left = (d - datetime.utcnow().date()).days
     return 0 <= days_left <= 5
 
 
 def card_description(card, limit=900):
     desc = card.get("desc", "").strip()
-
     if not desc:
         return "Opisaniya yozilmagan"
-
     return desc[:limit] + "..." if len(desc) > limit else desc
 
 
@@ -294,7 +199,6 @@ def member_names(card, member_map):
 
 def initialize_known_cards():
     global known_cards
-
     cards = get_cards()
     list_map = build_list_map()
 
@@ -306,12 +210,9 @@ def initialize_known_cards():
 
 def check_trello_changes():
     global known_cards
-
     cards = get_cards()
     list_map = build_list_map()
     member_map = build_member_map()
-    option_map = build_custom_option_map()
-
     new_known = {}
 
     for card in cards:
@@ -319,13 +220,12 @@ def check_trello_changes():
         card_name = card.get("name", "Nomsiz karta")
         list_name = list_map.get(card.get("idList"), "Noma’lum ustun")
         old_list = known_cards.get(card_id)
-
         new_known[card_id] = list_name
 
         if not is_current_year_card(card):
             continue
 
-        zayavka_type = get_card_type(card, option_map)
+        zayavka_type = get_card_type(card)
 
         if card_id not in known_cards:
             send_message(
@@ -354,11 +254,9 @@ def check_trello_changes():
 
         if is_due_within_5_days(card, list_name):
             warning_key = f"{card_id}_5days"
-
             if warning_key not in warned_5_days:
                 d = due_date(card)
                 days_left = (d - datetime.utcnow().date()).days
-
                 send_message(
                     f"⚠️ Muddat yaqinlashmoqda\n\n"
                     f"📌 Zayavka: {card_name}\n"
@@ -370,28 +268,21 @@ def check_trello_changes():
                     f"📝 Opisaniya:\n{card_description(card)}\n\n"
                     f"🔗 {card_short_url(card)}"
                 )
-
                 warned_5_days.add(warning_key)
 
     known_cards.update(new_known)
 
 
 def calculate_stats(filter_type=None):
-    all_cards = get_cards()
+    cards = [c for c in get_cards() if is_current_year_card(c)]
     list_map = build_list_map()
     member_map = build_member_map()
-    option_map = build_custom_option_map()
-
-    cards = [c for c in all_cards if is_current_year_card(c)]
 
     if filter_type:
-        cards = [c for c in cards if get_card_type(c, option_map) == filter_type]
+        cards = [c for c in cards if get_card_type(c) == filter_type]
 
     total = len(cards)
-    active = 0
-    done = 0
-    overdue = 0
-    no_due = 0
+    active = done = overdue = no_due = 0
 
     type_stats = {
         "Mahalliy": 0,
@@ -408,7 +299,7 @@ def calculate_stats(filter_type=None):
         done_status = is_done(list_name)
         overdue_status = is_overdue(card, list_name)
         no_due_status = not card.get("due") and not done_status
-        card_type = get_card_type(card, option_map)
+        card_type = get_card_type(card)
 
         if done_status:
             done += 1
@@ -443,11 +334,7 @@ def calculate_stats(filter_type=None):
                 }
 
             employee_stats[name]["total"] += 1
-
-            if done_status:
-                employee_stats[name]["done"] += 1
-            else:
-                employee_stats[name]["active"] += 1
+            employee_stats[name]["done" if done_status else "active"] += 1
 
             if overdue_status:
                 employee_stats[name]["overdue"] += 1
@@ -480,10 +367,8 @@ def generate_report(filter_type=None):
     s = calculate_stats(filter_type)
 
     text = f"📊 Xarid bo‘limi hisobot — {current_year()} yil\n"
-
     if filter_type:
         text += f"📌 Filtr: {filter_type}\n"
-
     text += "\n"
 
     text += "━━━━━━━━━━━━━━━━━━\n"
@@ -506,7 +391,6 @@ def generate_report(filter_type=None):
     text += "━━━━━━━━━━━━━━━━━━\n"
     text += "📂 USTUNLAR BO‘YICHA JARAYONDA\n"
     text += "━━━━━━━━━━━━━━━━━━\n"
-
     for name, count in sorted(s["column_stats"].items()):
         if not is_done(name):
             text += f"{name}: {count} ta\n"
@@ -533,20 +417,15 @@ def generate_report(filter_type=None):
     return text
 
 
-def debug_turi():
+def debug_labels():
     cards = [c for c in get_cards() if is_current_year_card(c)]
-    option_map = build_custom_option_map()
+    text = "🧪 LABEL DEBUG\n\n"
 
-    text = "🧪 ZAYAVKA TURI DEBUG\n\n"
-
-    for card in cards[:5]:
-        detected = get_card_type(card, option_map)
-        plugin_data = get_card_plugin_data(card["id"])
-        sample = " ".join(collect_all_text(plugin_data))[:1000]
-
-        text += f"📌 {card.get('name', '')[:100]}\n"
-        text += f"Topilgan turi: {detected}\n"
-        text += f"PluginData sample:\n{sample}\n\n"
+    for card in cards[:15]:
+        labels = [l.get("name", "") for l in card.get("labels", [])]
+        text += f"📌 {card.get('name', '')[:90]}\n"
+        text += f"Labels: {labels}\n"
+        text += f"Topilgan turi: {get_card_type(card)}\n\n"
 
     return text
 
@@ -557,7 +436,6 @@ def get_latest_update_id():
             f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
             timeout=20
         ).json()
-
         updates = result.get("result", [])
         return updates[-1]["update_id"] if updates else None
     except Exception:
@@ -568,7 +446,6 @@ def handle_telegram_commands():
     global last_update_id
 
     params = {"timeout": 20}
-
     if last_update_id is not None:
         params["offset"] = last_update_id + 1
 
@@ -590,18 +467,14 @@ def handle_telegram_commands():
 
         if text in ["/hisobot", "hisobot"]:
             send_message(generate_report())
-
         elif text in ["/mahalliy", "mahalliy"]:
             send_message(generate_report("Mahalliy"))
-
         elif text in ["/import", "import"]:
             send_message(generate_report("Import"))
-
         elif text in ["/aralash", "aralash"]:
             send_message(generate_report("Aralash"))
-
-        elif text in ["/debug_turi", "debug_turi"]:
-            send_message(debug_turi())
+        elif text in ["/debug_labels", "debug_labels"]:
+            send_message(debug_labels())
 
 
 def bot_loop():
