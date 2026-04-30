@@ -1,10 +1,11 @@
 import os
+import re
 import time
 import json
 import threading
 import requests
 from flask import Flask
-from datetime import datetime
+from datetime import datetime, timedelta
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = str(os.getenv("CHAT_ID"))
@@ -20,6 +21,7 @@ app = Flask(__name__)
 last_update_id = None
 known_cards = {}
 warned_5_days = set()
+plugin_cache = {}
 
 
 @app.route("/")
@@ -48,6 +50,7 @@ def send_message(text):
 
 def trello_get(path, extra=None):
     params = {"key": TRELLO_KEY, "token": TRELLO_TOKEN}
+
     if extra:
         params.update(extra)
 
@@ -58,7 +61,10 @@ def trello_get(path, extra=None):
         print("Trello xato:", r.status_code, r.text[:500])
         return []
 
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        return []
 
 
 def get_cards():
@@ -82,6 +88,20 @@ def get_custom_fields():
     return trello_get(f"boards/{BOARD_ID}/customFields")
 
 
+def get_card_plugin_data(card_id):
+    now = time.time()
+
+    if card_id in plugin_cache:
+        saved_time, saved_data = plugin_cache[card_id]
+        if now - saved_time < 300:
+            return saved_data
+
+    data = trello_get(f"cards/{card_id}/pluginData")
+    plugin_cache[card_id] = (now, data)
+
+    return data
+
+
 def build_list_map():
     return {x["id"]: x["name"] for x in get_lists()}
 
@@ -100,6 +120,7 @@ def build_custom_option_map():
         for opt in field.get("options", []):
             opt_id = opt.get("id")
             opt_text = opt.get("value", {}).get("text", "")
+
             if opt_id and opt_text:
                 option_map[opt_id] = opt_text
 
@@ -124,7 +145,8 @@ def collect_all_text(obj):
         return result
 
     if isinstance(obj, dict):
-        for value in obj.values():
+        for key, value in obj.items():
+            result.append(str(key))
             result.extend(collect_all_text(value))
         return result
 
@@ -140,13 +162,19 @@ def collect_all_text(obj):
 def detect_type_from_text(text):
     t = (text or "").lower()
 
-    if "aralash" in t or "аралаш" in t:
+    if "aralash" in t or "аралаш" in t or "смеш" in t:
         return "Aralash"
 
     if "import" in t or "импорт" in t:
         return "Import"
 
-    if "mahalliy" in t or "mahalli" in t or "махаллий" in t or "маҳаллий" in t:
+    if (
+        "mahalliy" in t
+        or "mahalli" in t
+        or "махаллий" in t
+        or "маҳаллий" in t
+        or "local" in t
+    ):
         return "Mahalliy"
 
     return None
@@ -163,16 +191,21 @@ def get_card_type(card, option_map):
 
     for item in card.get("customFieldItems", []):
         option_id = item.get("idValue")
+
         if option_id in option_map:
             texts.append(option_map[option_id])
 
         value = item.get("value", {})
-        for v in value.values():
-            texts.append(str(v))
+        texts.extend(collect_all_text(value))
 
     texts.extend(collect_all_text(card.get("pluginData", [])))
 
-    detected = detect_type_from_text(" ".join(texts))
+    plugin_data = get_card_plugin_data(card["id"])
+    texts.extend(collect_all_text(plugin_data))
+
+    joined = " ".join(texts)
+    detected = detect_type_from_text(joined)
+
     return detected if detected else "Aniqlanmagan"
 
 
@@ -182,13 +215,21 @@ def is_done(list_name):
 
 def is_current_year_card(card):
     year = current_year()
-    all_text = " ".join(collect_all_text(card))
+    name = card.get("name", "")
+    desc = card.get("desc", "")
 
-    if year in all_text:
-        return True
+    years_in_name = re.findall(r"20\d{2}", name)
 
-    if card.get("due") and card["due"][:4] == year:
-        return True
+    if years_in_name:
+        return year in years_in_name
+
+    years_in_desc = re.findall(r"20\d{2}", desc)
+
+    if years_in_desc:
+        return year in years_in_desc
+
+    if card.get("due"):
+        return card["due"][:4] == year
 
     return False
 
@@ -210,17 +251,22 @@ def due_text(card):
 
 def is_overdue(card, list_name):
     d = due_date(card)
+
     if not d:
         return False
+
     if is_done(list_name):
         return False
+
     return d < datetime.utcnow().date()
 
 
 def is_due_within_5_days(card, list_name):
     d = due_date(card)
+
     if not d:
         return False
+
     if is_done(list_name):
         return False
 
@@ -230,6 +276,7 @@ def is_due_within_5_days(card, list_name):
 
 def card_description(card, limit=900):
     desc = card.get("desc", "").strip()
+
     if not desc:
         return "Opisaniya yozilmagan"
 
@@ -268,16 +315,17 @@ def check_trello_changes():
     new_known = {}
 
     for card in cards:
-        if not is_current_year_card(card):
-            continue
-
         card_id = card["id"]
         card_name = card.get("name", "Nomsiz karta")
         list_name = list_map.get(card.get("idList"), "Noma’lum ustun")
         old_list = known_cards.get(card_id)
-        zayavka_type = get_card_type(card, option_map)
 
         new_known[card_id] = list_name
+
+        if not is_current_year_card(card):
+            continue
+
+        zayavka_type = get_card_type(card, option_map)
 
         if card_id not in known_cards:
             send_message(
@@ -395,7 +443,11 @@ def calculate_stats(filter_type=None):
                 }
 
             employee_stats[name]["total"] += 1
-            employee_stats[name]["done" if done_status else "active"] += 1
+
+            if done_status:
+                employee_stats[name]["done"] += 1
+            else:
+                employee_stats[name]["active"] += 1
 
             if overdue_status:
                 employee_stats[name]["overdue"] += 1
@@ -428,8 +480,10 @@ def generate_report(filter_type=None):
     s = calculate_stats(filter_type)
 
     text = f"📊 Xarid bo‘limi hisobot — {current_year()} yil\n"
+
     if filter_type:
         text += f"📌 Filtr: {filter_type}\n"
+
     text += "\n"
 
     text += "━━━━━━━━━━━━━━━━━━\n"
@@ -452,6 +506,7 @@ def generate_report(filter_type=None):
     text += "━━━━━━━━━━━━━━━━━━\n"
     text += "📂 USTUNLAR BO‘YICHA JARAYONDA\n"
     text += "━━━━━━━━━━━━━━━━━━\n"
+
     for name, count in sorted(s["column_stats"].items()):
         if not is_done(name):
             text += f"{name}: {count} ta\n"
@@ -483,15 +538,15 @@ def debug_turi():
     option_map = build_custom_option_map()
 
     text = "🧪 ZAYAVKA TURI DEBUG\n\n"
-    text += f"Custom optionlar soni: {len(option_map)} ta\n\n"
 
     for card in cards[:5]:
         detected = get_card_type(card, option_map)
-        all_text = " ".join(collect_all_text(card))[:700]
+        plugin_data = get_card_plugin_data(card["id"])
+        sample = " ".join(collect_all_text(plugin_data))[:1000]
 
         text += f"📌 {card.get('name', '')[:100]}\n"
         text += f"Topilgan turi: {detected}\n"
-        text += f"Matn namunasi:\n{all_text}\n\n"
+        text += f"PluginData sample:\n{sample}\n\n"
 
     return text
 
@@ -513,6 +568,7 @@ def handle_telegram_commands():
     global last_update_id
 
     params = {"timeout": 20}
+
     if last_update_id is not None:
         params["offset"] = last_update_id + 1
 
